@@ -1,159 +1,64 @@
-import os
+import torch
 import sys
-sys.setrecursionlimit(5000)
-from colabdesign import mk_afdesign_model, clear_mem
-from IPython.display import HTML
-from google.colab import files
-import numpy as np
-import jax
-import jax.numpy as jnp
-from colabdesign.af.alphafold.common import residue_constants
+import importlib
+from pathlib import Path
 
-def get_pdb(pdb_code=""):
-    if pdb_code is None or pdb_code == "":
-        upload_dict = files.upload()
-        pdb_string = upload_dict[list(upload_dict.keys())[0]]
-        with open("tmp.pdb", "wb") as out:
-            out.write(pdb_string)
-        return "tmp.pdb"
-    elif os.path.isfile(pdb_code):
-        return pdb_code
-    elif len(pdb_code) == 4:
-        os.system(f"wget -qnc https://files.rcsb.org/view/{pdb_code}.pdb")
-        return f"{pdb_code}.pdb"
-    else:
-        os.system(f"wget -qnc https://alphafold.ebi.ac.uk/files/AF-{pdb_code}-F1-model_v3.pdb")
-        return f"AF-{pdb_code}-F1-model_v3.pdb"
+# ✅ Portable project path setup
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-def add_cyclic_offset(self, offset_type=2):
-    def cyclic_offset(L):
-        i = np.arange(L)
-        ij = np.stack([i, i+L], -1)
-        offset = i[:,None] - i[None,:]
-        c_offset = np.abs(ij[:,None,:,None] - ij[None,:,None,:]).min((2,3))
+# Clear cached modules
+for mod_name in list(sys.modules.keys()):
+    if 'model' in mod_name.lower():
+        del sys.modules[mod_name]
 
-        if offset_type == 1:
-            c_offset = c_offset
-        elif offset_type >= 2:
-            a = c_offset < np.abs(offset)
-            c_offset[a] = -c_offset[a]
+# Import model
+import model.model as model_module
+importlib.reload(model_module)
+RNN_VAE = model_module.RNN_VAE
 
-        if offset_type == 3:
-            idx = np.abs(c_offset) > 2
-            c_offset[idx] = (32 * c_offset[idx]) / np.abs(c_offset[idx])
+# Device & parameters
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+Z_DIM = 256
 
-        return c_offset * np.sign(offset)
+# ✅ Relative model path
+MODEL_CHECKPOINT = PROJECT_ROOT / "models" / "vae_pretrain" / "model_best.ckpt"
 
-    idx = self._inputs["residue_index"]
-    offset = np.array(idx[:,None] - idx[None,:])
+model_params = {
+    'n_vocab': 24,
+    'max_seq_len': 35,
+    'z_dim': Z_DIM,
+    'emb_dim': 50,
+    'PAD_IDX': 1,
+    'device': DEVICE,
+    'GRUEncoder_params': {
+        'h_dim': 256,
+        'biGRU': True,
+        'layers': 2,
+        'p_dropout': 0.2
+    },
+    'GRUDecoder_params': {
+        'h_dim': 256,
+        'p_word_dropout': 0.1,
+        'p_out_dropout': 0.2,
+        'skip_connetions': False
+    }
+}
 
-    if self.protocol == "binder":
-        c_offset = cyclic_offset(self._binder_len)
-        offset[self._target_len:, self._target_len:] = c_offset
+# Initialize and load
+model = RNN_VAE(**model_params).to(DEVICE)
 
-    if self.protocol in ["fixbb", "partial", "hallucination"]:
-        Ln = 0
-        for L in self._lengths:
-            offset[Ln:Ln+L, Ln:Ln+L] = cyclic_offset(L)
-            Ln += L
+if not MODEL_CHECKPOINT.exists():
+    raise FileNotFoundError(
+        f"Checkpoint not found: {MODEL_CHECKPOINT}\n"
+        "Please download model weights and place them in models/vae_pretrain/"
+    )
 
-    self._inputs["offset"] = offset
-    print(f"✅ Cyclic Offset Injected (Type {offset_type})")
+state_dict = torch.load(MODEL_CHECKPOINT, map_location=DEVICE)
+model.load_state_dict(state_dict)
+model.eval()
 
-def add_rg_loss(model, weight=0.1):
-    def loss_fn(inputs, outputs):
-        xyz = outputs["structure_module"]
-        ca = xyz["final_atom_positions"][:, residue_constants.atom_order["CA"]]
-        rg = jnp.sqrt(jnp.square(ca - ca.mean(0)).sum(-1).mean() + 1e-8)
-        rg_th = 2.38 * ca.shape[0] ** 0.365
-        return {"rg": jax.nn.elu(rg - rg_th)}
-
-    if "loss" not in model._callbacks["model"]:
-        model._callbacks["model"]["loss"] = []
-    model._callbacks["model"]["loss"].append(loss_fn)
-    model.opt["weights"]["rg"] = weight
-
-def add_pocket_region_bias(model, start_res=54, end_res=99, weight=1.0):
-    def loss_fn(inputs, outputs):
-        pos = outputs["structure_module"]["final_atom_positions"]
-        ca_idx = residue_constants.atom_order["CA"]
-
-        b_start = model._target_len
-        b_end = b_start + model._binder_len
-        binder_ca = pos[b_start:b_end, ca_idx]
-        pocket_ca = pos[start_res-1:end_res, ca_idx]
-
-        pocket_center = jnp.mean(pocket_ca, axis=0)
-        d = jnp.linalg.norm(binder_ca - pocket_center[None, :], axis=-1)
-        loss = jnp.mean(jax.nn.relu(d - 10.0))
-        return {"pocket_region": loss}
-
-    if "loss" not in model._callbacks["model"]:
-        model._callbacks["model"]["loss"] = []
-    model._callbacks["model"]["loss"].append(loss_fn)
-    model.opt["weights"]["pocket_region"] = weight
-    print(f"✅ Pocket region bias added: {start_res}-{end_res}")
-
-def add_self_avoidance_loss(model, weight=0.1):
-    def loss_fn(inputs, outputs):
-        pos = outputs["structure_module"]["final_atom_positions"]
-        ca_idx = residue_constants.atom_order["CA"]
-        pos = pos[:, ca_idx, :]
-        diff = pos[:, None, :] - pos[None, :, :]
-        dists = jnp.sqrt(jnp.sum(jnp.square(diff), axis=-1) + 1e-8)
-        L = pos.shape[0]
-        mask = jnp.ones((L, L))
-        for i in range(-2, 3):
-            mask -= jnp.eye(L, k=i)
-        penalty = jnp.maximum(0.0, 4.0 - dists) * mask
-        total_penalty = jnp.sum(penalty)
-        return {"avoidance": jnp.where(jnp.isnan(total_penalty), 0.0, total_penalty)}
-
-    if "loss" not in model._callbacks["model"]:
-        model._callbacks["model"]["loss"] = []
-    model._callbacks["model"]["loss"].append(loss_fn)
-    model.opt["weights"]["avoidance"] = weight
-
-# Patch the class
-mk_afdesign_model.add_cyclic_offset = add_cyclic_offset
-print("✅ All Functions Defined.")
-
-clear_mem()
-
-af_model = mk_afdesign_model(protocol="binder", use_multimer=True, data_dir='./params')
-af_model.prep_inputs(pdb_filename=get_pdb("1YCR"), chain="A", binder_len=12)
-
-# Apply custom losses and offsets
-af_model.add_cyclic_offset(offset_type=2)
-add_rg_loss(af_model, weight=0.5)
-
-target_hotspots = [54, 55, 57, 59, 61, 62, 67, 75, 86, 91, 96, 99]
-start_res = min(target_hotspots)
-end_res = max(target_hotspots)
-
-print(f"Using Pocket Region: {start_res} to {end_res}")
-add_pocket_region_bias(af_model, start_res=start_res, end_res=end_res, weight=1.0)
-add_self_avoidance_loss(af_model, weight=0.1)
-
-# Set optimization weights
-af_model.opt["weights"]["plddt"] = 1.0
-af_model.opt["weights"]["ptm"] = 0.1
-af_model.opt["weights"]["binding"] = 1.0
-af_model.opt["weights"]["i_ptm"] = 0.5
-
-print("Hotspots set:", target_hotspots)
-print("target_length:", af_model._target_len)
-print("binder_length:", af_model._binder_len)
-
-# Run design stages
-af_model.set_seq(mode="gumbel")
-af_model.design_soft(iters=200, save_best=True, verbose=True)
-
-af_model.set_seq(mode="hard")
-af_model.design_hard(iters=100, temp=0.1, save_best=True, verbose=True)
-
-af_model.design_pssm_semigreedy(soft_iters=100, hard_iters=50, save_best=True, verbose=True)
-
-# Save and visualize
-af_model.save_pdb(f"{af_model.protocol}_cyclic_binder.pdb")
-af_model.plot_pdb()
+print(f"✅ Model loaded successfully with z_dim={model.z_dim}")
+print(f"   Device: {DEVICE}")
+print(f"   Checkpoint: {MODEL_CHECKPOINT}")
