@@ -1,0 +1,308 @@
+import torch
+import pandas as pd
+import torch.nn.functional as F
+import numpy as np
+import sys
+import os
+import importlib
+from pathlib import Path
+
+# ==============================================================================
+# 1. PORTABLE PATH CONFIGURATION
+# ==============================================================================
+# Dynamically locate project root relative to THIS script file
+PROJECT_ROOT = Path(__file__).resolve().parent
+print(f" Project Root: {PROJECT_ROOT}")
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# ==============================================================================
+# 2. IMPORTS
+# ==============================================================================
+try:
+    from model.model import RNN_VAE
+    print("✅ Loaded RNN_VAE from model/model.py")
+except ImportError:
+    try:
+        from model import RNN_VAE
+        print("✅ Loaded RNN_VAE from model.py")
+    except ImportError:
+        raise Exception("❌ Could not find RNN_VAE. Check your file structure.")
+
+import VAE_configuration as Params
+import losses
+from torch.utils.data import Dataset, DataLoader
+
+print("✅ All imports successful!")
+
+# TensorBoard setup
+if Params.log_results:
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(str(PROJECT_ROOT / 'results' / 'runs'))
+
+# ==============================================================================
+# 3. DATASET CLASS
+# ==============================================================================
+class Peptide_dataset(Dataset):
+    def __init__(self, df):
+        self.device = Params.device
+        self.data = df
+        self.token = Params.dataset_params['token']
+        self.max_len = Params.dataset_params['max_seq_len']
+
+    def __tokenize__(self, seq):
+        token = self.token
+        seq_list = [token['start']]
+        for letter in seq[:self.max_len]:
+            if letter in token.keys():
+                seq_list.append(token[letter])
+            else:
+                seq_list.append(token['unk'])
+        seq_list.append(token['eos'])
+        return seq_list
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        seq = self.data['seq'][idx]
+        seq_token = self.__tokenize__(seq)
+        return torch.tensor(seq_token, device=self.device)
+
+# ==============================================================================
+# 4. LOSS FUNCTIONS
+# ==============================================================================
+def recon_dec(gt_seq, logits):
+    """Reconstruction loss with padding ignore."""
+    PAD_IDX = Params.dataset_params['token']['pad']
+    return F.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        gt_seq.view(-1),
+        reduction='mean',
+        ignore_index=PAD_IDX
+    )
+
+def kl_gaussianprior(mu, logvar):
+    """Analytical KL divergence with unit Gaussian prior."""
+    return torch.mean(0.5 * torch.sum(
+        (logvar.exp() + mu ** 2 - 1 - logvar), 1
+    ))
+
+def pz_losses(z, z_mu, z_logvar, cur_step):
+    """Prior regularization loss (KL or MMD)."""
+    if not Params.use_kl:
+        z_regu_loss = losses.wae_mmd_gaussianprior(z, method='rf')
+    else:
+        z_regu_loss = kl_gaussianprior(z_mu, z_logvar)
+
+    z_logvar_L1 = z_logvar.abs().sum(1).mean(0)
+    z_logvar_KL_penalty = losses.kl_gaussian_sharedmu(z_mu, z_logvar)
+    beta = losses.anneal(cur_step)
+
+    pz_loss = (beta * z_regu_loss
+               + Params.loss_weights['lambda_logvar_L1'] * z_logvar_L1
+               + Params.loss_weights['lambda_logvar_KL'] * z_logvar_KL_penalty)
+    return pz_loss
+
+def running_avg(avg_val, cur_val, it):
+    it = it + 1
+    return avg_val * (it - 1) / it + cur_val / it
+
+def calculate_loss(model, dataset_iter, cur_step, is_train):
+    """Calculates reconstruction and prior losses."""
+    batch = next(dataset_iter)
+    
+    if isinstance(batch, tuple):
+        seq_token = batch[0]
+    else:
+        seq_token = batch
+    
+    PAD_IDX = Params.dataset_params['token']['pad']
+    (z_mu, z_logvar), z, dec_logits = model(seq_token)
+
+    recon_loss = recon_dec(seq_token, dec_logits)
+    pz_loss = pz_losses(z, z_mu, z_logvar, cur_step)
+    total_loss = recon_loss * Params.loss_weights['recon'] + pz_loss * Params.loss_weights['pz']
+    cur_losses = [total_loss, recon_loss, pz_loss]
+
+    if not is_train:
+        original_seqs = seq_token[:2]
+        sampled_seqs = model.sampling_sequences(z_mu[:2])
+        
+        max_valid_len = original_seqs.size(1)
+        if sampled_seqs.size(1) > max_valid_len:
+            sampled_seqs = sampled_seqs[:, :max_valid_len]
+        elif sampled_seqs.size(1) < max_valid_len:
+            pad_len = max_valid_len - sampled_seqs.size(1)
+            sampled_seqs = torch.nn.functional.pad(sampled_seqs, (0, pad_len), value=PAD_IDX)
+            
+        N_mismatch = torch.sum(sampled_seqs != original_seqs)
+        cur_losses = cur_losses + [N_mismatch]
+
+        sampled_seqs_shift = model.sampling_sequences_shift(z_mu[:2])
+        if sampled_seqs_shift.size(1) > max_valid_len:
+            sampled_seqs_shift = sampled_seqs_shift[:, :max_valid_len]
+        elif sampled_seqs_shift.size(1) < max_valid_len:
+            pad_len = max_valid_len - sampled_seqs_shift.size(1)
+            sampled_seqs_shift = torch.nn.functional.pad(sampled_seqs_shift, (0, pad_len), value=PAD_IDX)
+            
+        N_mismatch_shift = torch.sum(sampled_seqs_shift != original_seqs)
+        cur_losses = cur_losses + [N_mismatch_shift]
+        
+        print("Original:", original_seqs)
+        print("Sampled:", sampled_seqs)
+        print("Shifted:", sampled_seqs_shift)
+        
+    return cur_losses
+
+def step_model(model, cur_epoch, dataset, optimizer, require_grad=True):
+    dataset_iter = iter(dataset)
+    if require_grad:
+        avg_losses = [0, 0, 0]
+        for it in range(len(dataset)):
+            cur_step = cur_epoch * len(dataset_iter) + it
+            cur_losses = calculate_loss(model, dataset_iter, cur_step, is_train=require_grad)
+            model.zero_grad()
+            optimizer.zero_grad()
+            cur_losses[0].backward()
+            optimizer.step()
+            with torch.no_grad():
+                avg_losses = [running_avg(avg_losses[idx], cur_losses[idx], it).item() 
+                              for idx in range(len(avg_losses))]
+    else:
+        with torch.no_grad():
+            avg_losses = [0, 0, 0, 0, 0]
+            for it in range(len(dataset)):
+                cur_step = cur_epoch * len(dataset_iter) + it
+                cur_losses = calculate_loss(model, dataset_iter, cur_step, is_train=require_grad)
+                avg_losses = [running_avg(avg_losses[idx], cur_losses[idx], it).item() 
+                              for idx in range(len(avg_losses))]
+    return avg_losses
+
+def train(training_params, model_params, dataset_params, device):
+    TP = training_params
+    MP = model_params
+    DP = dataset_params
+
+    print('Training base VAE ...')
+
+    if not Params.resume_train:
+        model = RNN_VAE(**MP).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=TP['lr'])
+    else:
+        # Add your resume logic here
+        pass
+
+    np.random.seed(2021)
+    df = pd.read_csv(DP['data_path'])
+    if Params.debug:
+        df = df[:1000]
+
+    df = df.sample(frac=1).reset_index(drop=True)
+    max_seq_len = DP['max_seq_len']
+    train_eval_ratio = DP['train_eval_ratio']
+
+    N_seq = len(df)
+    N_train = int(N_seq * train_eval_ratio)
+    df_train = df[:N_train].sample(frac=1).reset_index(drop=True)
+    df_test = df[N_train:].sample(frac=1).reset_index(drop=True)
+
+    train_dataset = Peptide_dataset(df_train)
+    test_dataset = Peptide_dataset(df_test)
+
+    print(f'len train data: {len(df_train)}')
+    print(f'len test data: {len(df_test)}')
+
+    PAD_IDX = Params.dataset_params['token']['pad']
+    
+    def safe_collate(batch):
+        seqs = [item for item in batch]
+        lengths = torch.tensor([len(s) for s in seqs])
+        padded = torch.nn.utils.rnn.pad_sequence(seqs, batch_first=True, padding_value=PAD_IDX)
+        return padded, lengths
+
+    cur_test_loss = 1000
+
+    for epoch in range(TP['epochs']):
+        train_dataloader = DataLoader(
+            train_dataset, 
+            batch_size=TP['train_batch_size'], 
+            shuffle=TP['shuffle'],
+            collate_fn=safe_collate
+        )
+        
+        train_losses = step_model(model, epoch, train_dataloader, optimizer, require_grad=True)
+        print(f'Train epoch:{epoch}', train_losses)
+
+        test_dataloader = DataLoader(
+            test_dataset, 
+            batch_size=TP['test_batch_size'], 
+            shuffle=True,
+            collate_fn=safe_collate
+        )
+        
+        test_losses = step_model(model, epoch, test_dataloader, optimizer, require_grad=False)
+        print(f'Test epoch:{epoch}', test_losses)
+
+        if cur_test_loss >= test_losses[0]:
+            cur_test_loss = test_losses[0]
+            os.makedirs(TP['model_save_folder'], exist_ok=True)
+            torch.save(model.state_dict(), f"{TP['model_save_folder']}/model_best.ckpt")
+            
+        if epoch % 20 == 0:
+            os.makedirs(TP['model_save_folder'], exist_ok=True)
+            torch.save(model.state_dict(), f"{TP['model_save_folder']}/model_{epoch}.ckpt")
+            
+        if epoch % 100 == 0:
+            os.makedirs(TP['model_save_folder'], exist_ok=True)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': train_losses
+            }, f"{TP['model_save_folder']}/train_model_{epoch}.ckpt")
+
+        if Params.log_results:
+            train_setup = {'total_loss': train_losses[0], 'recon_loss': train_losses[1], 'pz_loss': train_losses[2]}
+            test_setup = {'total_loss': test_losses[0], 'recon_loss': test_losses[1], 
+                         'pz_loss': test_losses[2], 'N_mismatch': test_losses[3], 'N_mismatch_shift': test_losses[4]}
+            for key, value in train_setup.items():
+                writer.add_scalar('Train/' + key, value, epoch)
+            for key, value in test_setup.items():
+                writer.add_scalar('Test/' + key, value, epoch)
+
+    torch.cuda.empty_cache()
+
+if __name__ == '__main__':
+    # Ensure output directories exist using relative paths
+    RESULT_DIR = PROJECT_ROOT / 'results'
+    RUNS_DIR = RESULT_DIR / 'runs'
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    
+    # Copy config and model files to results folder for reproducibility
+    config_src = PROJECT_ROOT / 'VAE_configuration.py'
+    model_src = PROJECT_ROOT / 'model' / 'model.py'
+    
+    if config_src.exists():
+        import shutil
+        shutil.copy2(config_src, RESULT_DIR / 'configure_file.py')
+        print("✅ Copied VAE_configuration.py")
+    else:
+        print(f"⚠️ Warning: Source config not found at {config_src}")
+        
+    if model_src.exists():
+        import shutil
+        shutil.copy2(model_src, RESULT_DIR / 'model_file.py')
+        print("✅ Copied model/model.py")
+    else:
+        print(f"⚠️ Warning: Source model not found at {model_src}")
+        
+    # Start Training
+    device = Params.device
+    training_params = Params.training_params
+    RNN_VAE_params = Params.RNN_VAE_params
+    dataset_params = Params.dataset_params
+    
+    train(training_params, RNN_VAE_params, dataset_params, device)
