@@ -6,9 +6,6 @@ import h5py
 import os 
 from pathlib import Path
 
-# ✅ IMPORT CONFIGURATION (Must be in same directory or project root)
-import VAE_configuration as Params
-
 # ==============================================================================
 # 1. PEPTIDE DATASET CLASS (Preserved Exactly)
 # ==============================================================================
