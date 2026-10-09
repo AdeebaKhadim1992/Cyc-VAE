@@ -1,0 +1,254 @@
+import torch
+import pandas as pd 
+import numpy as np
+import sys
+from shutil import copyfile
+
+from torch import nn
+import pickle 
+
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from xgboost import XGBClassifier
+from sklearn.neighbors import KNeighborsClassifier
+# ✅ ADD THESE NEW IMPORTS
+from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
+import h5py
+import os 
+
+def train_qcz(data, N_boots, model_name, save_folder):
+    # ✅ ROBUST LABEL EXTRACTION
+    raw_labels = data[:, -1]
+    labels = np.where(raw_labels >= 0.5, 1, 0).astype(int)
+    
+    pos_mask = labels == 1
+    neg_mask = labels == 0
+    
+    data_1 = data[pos_mask]
+    data_0 = data[neg_mask]
+    
+    print(f"📊 Data split: {len(data_1)} positive, {len(data_0)} negative")
+    
+    if len(data_1) == 0 or len(data_0) == 0:
+        raise ValueError("One class is missing! Check your label values in the HDF5 file.")
+    
+    # ... rest of your training logic ...
+    
+    # ... rest of your training logic ...
+    
+    np.random.shuffle(data_1)
+    np.random.shuffle(data_0)
+
+    ratio = 0.8
+    train_N_1 = int(len(data_1) * ratio)
+    train_N_0 = int(len(data_0) * ratio)
+    
+    training = np.concatenate([data_1[:train_N_1], data_0[:train_N_0]], axis=0)
+    np.random.shuffle(training)
+
+    testing = np.concatenate([data_1[train_N_1:], data_0[train_N_0:]], axis=0)
+    np.random.shuffle(testing)
+
+    all_train_encodings = training[:, :-1]
+    all_labels = training[:, -1].astype(int)  # Ensure int for sklearn
+
+
+    testing = np.concatenate([data_1[train_N_1:], data_0[train_N_0:]], axis=0)
+    np.random.shuffle(testing)
+
+    all_train_encodings = training[:, :-1]
+    all_labels = training[:, -1].astype(int)  # Ensure int for sklearn
+    
+    # ... rest of your original code unchanged ...
+    # print ('all_labels',np.sum(all_labels==0))
+    # print ('all_labels',np.sum(all_labels==1))
+    # sys.exit(0)
+
+    if N_boots==1:
+        sample_N = all_train_encodings.shape[0]
+    else:
+        sample_N = int(all_train_encodings.shape[0]*0.8)
+        
+    boot_models=[]
+    for N_boot in range(N_boots):
+        print (f'N_boot: {N_boot}')
+        random_idx=np.random.permutation(all_train_encodings.shape[0])[:sample_N]
+        train_encodings=all_train_encodings[random_idx]
+        labels_batch=all_labels[random_idx]
+        
+        if model_name=='LR':
+            from sklearn.preprocessing import StandardScaler
+            # Scale data specifically for LR to ensure convergence
+            scaler_lr = StandardScaler()
+            train_enc_scaled = scaler_lr.fit_transform(train_encodings)
+            
+            LRC = LogisticRegression(
+                random_state=0, 
+                max_iter=5000,          # Increased from 1000 to prevent convergence warning
+                class_weight='balanced',
+                solver='lbfgs'
+            )
+            LRC.fit(train_enc_scaled, labels_batch)
+            # Store scaler with model so prediction can scale test data later
+            LRC.scaler_ = scaler_lr 
+            LRC.fit(train_encodings, labels_batch) # ✅ Explicit fit
+            
+        elif model_name=='SVC':
+            LRC = SVC(probability=True, kernel='linear', class_weight='balanced')
+            LRC.fit(train_encodings, labels_batch) # ✅ Explicit fit
+            
+        elif model_name=='XGB':
+            # Calculate weight for imbalance
+            pos_count = np.sum(labels_batch == 1)
+            neg_count = np.sum(labels_batch == 0)
+            weight = neg_count / pos_count if pos_count > 0 else 1
+            
+            LRC = XGBClassifier(eval_metric='auc', scale_pos_weight=weight, use_label_encoder=False, random_state=0)
+            LRC.fit(train_encodings, labels_batch) # ✅ THIS WAS LIKELY MISSING OR FAILED
+                    
+        elif model_name=='RF':
+            LRC = RandomForestClassifier(n_estimators=100, class_weight='balanced', n_jobs=-1, random_state=0)
+            LRC.fit(train_encodings, labels_batch) # ✅ Explicit fit
+            
+        elif model_name=='ADA':
+            LRC = AdaBoostClassifier(n_estimators=100, random_state=0)
+            LRC.fit(train_encodings, labels_batch) # ✅ Explicit fit
+            
+        elif model_name=='KNN':
+            LRC = KNeighborsClassifier(n_neighbors=5, metric='cosine')
+            LRC.fit(train_encodings, labels_batch) # ✅ Explicit fit
+
+        # Save the fitted model
+        directory=os.path.join(save_folder, model_name)
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+
+        model_file=os.path.join(directory, f"{model_name}{N_boot}.sav")
+        pickle.dump(LRC, open(model_file, 'wb'))
+        boot_models.append(LRC)
+
+    def boot_prediction(models,X): 
+        probs=[]
+        for model in models: 
+            probs.append(model.predict_proba(X))
+        # print (np.shape(probs))       
+        probs=np.mean(probs,axis=0)[:,1]
+        # print (np.shape(probs))   
+        pred_results=probs>0.5
+        return probs,pred_results
+
+    # print ('im here')
+
+
+    train_encodings=training[:,:-1]
+    train_labels=training[:,-1]
+    probs,pred=boot_prediction(boot_models,train_encodings)   
+    # test_label=np.load('test_encoding_y_14.npy')
+    train_acc=np.divide(np.sum(train_labels==pred),len(train_labels))
+    idx_1=pred==1
+    tp=np.sum((pred[idx_1]==train_labels[idx_1]))
+    fp=np.sum((pred[idx_1]!=train_labels[idx_1]))
+    if (tp+fp)==0:
+        precision = 0 
+    else:
+        precision = tp/(tp+fp)
+    print ('stats:','acc',train_acc,'len pred positive',np.sum(idx_1),'precision',precision)
+    return boot_models
+
+
+
+def train_qz(encodings,model_name,n_components,save_folder):
+    # with h5py.File(condition_filename+'.h5', 'r') as hf:
+    #   con_encodings=np.array(hf['data'])
+    #   print (con_encodings.shape)
+
+      # sys.exit(0)
+    # encodings=np.concatenate([con_encodings,ext_encodings],axis=1)
+    # print (encodings.shape)
+    # encodings=np.load('train_encoding_x_14.npy')
+    # print (encodings.shape)
+    # seqs,good_encodings,good_embedings,good_idx=MU.decode(encodings,obtain_embeding=True,allow_pad=True)
+    from sklearn.mixture import GaussianMixture #50
+    gm = GaussianMixture(n_components=n_components, random_state=0).fit(encodings)
+    # model_name='GMM2_14.sav'
+    directory=save_folder
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    pickle.dump(gm, open(directory+'/'+model_name, 'wb'))
+    return gm
+
+
+
+def load_model_test():
+    def boot_prediction(models,X): 
+        probs=[]
+        for model in models: 
+            probs.append(model.predict_proba(X))
+        # print (np.shape(probs))       
+        probs=np.mean(probs,axis=0)[:,1]
+        # print (np.shape(probs))   
+        pred_results=probs>0.5
+        return probs,pred_results
+    folder='sampling_models/qcz/SVC/'
+    boot_model_files=[folder+'SVC0.sav',folder+'SVC1.sav',folder+'SVC2.sav']
+    boot_models=[]
+    for boot_model_file in boot_model_files:
+        boot_models.append(pickle.load(open(boot_model_file,'rb')))
+
+    test_encoding=np.load('test_encoding_x.npy')
+    print ('im here 1')
+    probs,pred=boot_prediction(boot_models,test_encoding)   
+    print ('im here 2')
+    test_label=np.load('test_encoding_y.npy')
+    acc=np.divide(np.sum(test_label==pred),len(test_label))
+    print ('acc',acc)   
+    
+
+if __name__ == '__main__':
+    # ✅ WINDOWS CONFIGURATION
+     PROJECT_ROOT = Path(__file__).resolve().parent)
+    # ✅ CORRECT PATHS TO HDF5 FILES
+    LABELED_H5 = os.path.join(SAVE_DIR, 'binder_lab_encodings.h5')
+    UNLABELED_H5 = os.path.join(SAVE_DIR, 'binder_unlabeled_encodings.h5')
+    
+    N_BOOTS = 4              # Number of bootstrap models per classifier
+    GMM_COMPONENTS = 10      # n_components for GMM
+    
+    CLASSIFIERS = ['XGB', 'LR', 'ADA', 'RF', 'KNN']
+    
+    # ✅ LOAD LABELED DATA FOR q(c|z) TRAINING
+    if not os.path.exists(LABELED_H5):
+        raise FileNotFoundError(f"Labeled encodings not found: {LABELED_H5}\n"
+                                "You must first encode your labeled CSV through the VAE encoder.")
+    
+    with h5py.File(LABELED_H5, 'r') as hf:
+        data = np.array(hf['data'])
+    print(f"✅ Loaded labeled data: {data.shape}")
+    
+    # ✅ TRAIN CLASSIFIER ENSEMBLES
+    for clf_name in CLASSIFIERS:
+        print(f"\n Training {clf_name} ensemble ({N_BOOTS} boots)...")
+        train_qcz(data, N_boots=N_BOOTS, model_name=clf_name, save_folder=SAVE_DIR)
+    
+    # ✅ LOAD UNLABELED/BINDING ENCODINGS FOR GMM PRIOR
+    if not os.path.exists(UNLABELED_H5):
+        raise FileNotFoundError(f"Unlabeled encodings not found: {UNLABELED_H5}")
+    
+    with h5py.File(UNLABELED_H5, 'r') as hf:
+        ext_encodings = np.array(hf['data'])
+    print(f"✅ Loaded binding encodings for GMM: {ext_encodings.shape}")
+    
+    # ✅ TRAIN GMM PRIOR q(z)
+    print(f"\n🔧 Training GMM with {GMM_COMPONENTS} components...")
+    train_qz(ext_encodings, model_name='GMM_qz.pkl', 
+             n_components=GMM_COMPONENTS, save_folder=SAVE_DIR)
+    
+    # ✅ TRAIN SCALER (needed by MH sampler)
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler().fit(ext_encodings)
+    pickle.dump(scaler, open(os.path.join(SAVE_DIR, 'scaler.pkl'), 'wb'))
+    print("✅ Scaler saved.")
+    
+    print(f"\n ALL MH COMPONENTS SAVED TO: {SAVE_DIR}")
+    print("Files:", os.listdir(SAVE_DIR))
