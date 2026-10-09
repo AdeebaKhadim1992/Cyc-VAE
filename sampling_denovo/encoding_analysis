@@ -1,0 +1,125 @@
+import pandas as pd 
+import numpy as np 
+from torch.utils.data import Dataset, DataLoader
+import torch
+import seaborn as sns 
+from matplotlib import pyplot as plt
+import pickle
+import h5py
+import os
+from pathlib import Path
+
+# ==============================================================================
+# 1. PATHS & CONFIGURATION (Portable / Relative Paths)
+# ==============================================================================
+# Dynamically locate project root relative to THIS script file
+PROJECT_ROOT = Path(__file__).resolve().parent.parent  # Adjust if script is nested deeper
+
+MODEL_PATH = PROJECT_ROOT / 'model_best.ckpt'
+LABELLED_CSV = PROJECT_ROOT / 'binder_lab.csv'
+ENCODINGS_H5 = PROJECT_ROOT / 'mh_results' / 'label_extension13_train_beta.h5'
+
+MH_OUTPUT_DIR = PROJECT_ROOT / 'output' / 'default'
+SAMPLED_SEQ_FILE = MH_OUTPUT_DIR / 'len_4_det.txt'
+SAMPLED_ENC_FILE = MH_OUTPUT_DIR / 'sampled_encodings.npy'
+
+SURROGATE_MODEL_PATH = PROJECT_ROOT / 'mh_results' / 'qcz_f1' / 'KNN' / 'KNN0.sav'
+OUTPUT_FIGURE = PROJECT_ROOT / 'mh_results' / 'denovo_latent_space.png'
+
+print(f"📂 Project Root: {PROJECT_ROOT}")
+
+# ==============================================================================
+# 2. LOAD DATA
+# ==============================================================================
+
+# A. Load Training Encodings
+if not ENCODINGS_H5.exists():
+    raise FileNotFoundError(f"Training encodings not found at: {ENCODINGS_H5}")
+
+with h5py.File(ENCODINGS_H5, 'r') as hf:
+    train_data = np.array(hf['data'])
+train_encodings = train_data[:, :-1]
+train_labels = train_data[:, -1].astype(int)
+
+print(f"✅ Loaded training data: {train_encodings.shape[0]} sequences")
+
+# B. Load Sampled De Novo Sequences & Encodings
+if not SAMPLED_ENC_FILE.exists():
+    raise FileNotFoundError(
+        f"Sampled encodings not found at {SAMPLED_ENC_FILE}. "
+        f"Run get_seq_encodings() on your MH output first."
+    )
+sampled_encodings = np.load(SAMPLED_ENC_FILE)
+print(f"✅ Loaded sampled de novo data: {sampled_encodings.shape[0]} sequences")
+
+# C. Load Ground Truth Labels
+if not LABELLED_CSV.exists():
+    raise FileNotFoundError(f"Labeled CSV not found at: {LABELLED_CSV}")
+rank_df = pd.read_csv(LABELLED_CSV, keep_default_na=False)
+true_labels = rank_df['label'].tolist()[:len(train_encodings)]
+
+# D. Predict Labels for Sampled De Novo Sequences
+if not SURROGATE_MODEL_PATH.exists():
+    raise FileNotFoundError(f"Surrogate model not found at: {SURROGATE_MODEL_PATH}")
+
+surrogate_model = pickle.load(open(SURROGATE_MODEL_PATH, 'rb'))
+sampled_pred_labels = surrogate_model.predict(sampled_encodings)
+sampled_pred_probs = surrogate_model.predict_proba(sampled_encodings)[:, 1]
+
+print(f"🔮 De novo predictions: {np.sum(sampled_pred_labels==1)} binders / {len(sampled_pred_labels)} total")
+print(f"   Mean binder probability: {np.mean(sampled_pred_probs):.3f}")
+
+# ==============================================================================
+# 3. VISUALIZATION (t-SNE + PCA)
+# ==============================================================================
+complete_encodings = np.concatenate([train_encodings, sampled_encodings], axis=0)
+combined_labels = true_labels + [2] * len(sampled_encodings)
+evaluation_type = ['Training'] * len(train_encodings) + ['De Novo'] * len(sampled_encodings)
+
+viz_df = pd.DataFrame({
+    'x': None, 'y': None, 
+    'cat': combined_labels, 
+    'source': evaluation_type
+})
+
+fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+
+# --- t-SNE Plot ---
+from sklearn.manifold import TSNE
+tsne = TSNE(n_components=2, perplexity=30, random_state=2022, n_jobs=-1)
+tsne_emb = tsne.fit_transform(complete_encodings)
+viz_df.loc[:, 'x'] = tsne_emb[:, 0]
+viz_df.loc[:, 'y'] = tsne_emb[:, 1]
+
+sns.scatterplot(data=viz_df, x="x", y="y", hue="cat", style='source', 
+                palette={0: 'gray', 1: 'green', 2: 'red'}, ax=axes[0])
+axes[0].set_title('t-SNE: Training vs De Novo Samples', fontsize=14)
+axes[0].legend(title='Label (0=Non-Binder, 1=Binder, 2=De Novo)')
+
+# --- PCA Plot ---
+from sklearn.decomposition import PCA
+pca = PCA(n_components=2)
+pca_emb = pca.fit_transform(complete_encodings)
+viz_df.loc[:, 'x'] = pca_emb[:, 0]
+viz_df.loc[:, 'y'] = pca_emb[:, 1]
+
+sns.scatterplot(data=viz_df, x="x", y="y", hue="cat", style='source', 
+                palette={0: 'gray', 1: 'green', 2: 'red'}, ax=axes[1])
+axes[1].set_title('PCA: Training vs De Novo Samples', fontsize=14)
+
+plt.tight_layout()
+plt.savefig(OUTPUT_FIGURE, dpi=300)
+print(f" Figure saved to: {OUTPUT_FIGURE}")
+plt.show()
+
+# ==============================================================================
+# 4. QUALITY METRICS FOR PAPER
+# ==============================================================================
+print("\n" + "="*60)
+print("DE NOVO DESIGN QUALITY METRICS")
+print("="*60)
+print(f"Total de novo sequences evaluated: {len(sampled_encodings)}")
+print(f"Predicted binders (label=1): {np.sum(sampled_pred_labels==1)} ({100*np.mean(sampled_pred_labels):.1f}%)")
+print(f"Mean predicted binder probability: {np.mean(sampled_pred_probs):.4f}")
+print(f"Top 10% binder probability threshold: {np.percentile(sampled_pred_probs, 90):.4f}")
+print(f"Sequences above top-10% threshold: {np.sum(sampled_pred_probs >= np.percentile(sampled_pred_probs, 90))}")
