@@ -1,0 +1,215 @@
+import pandas as pd 
+import numpy as np 
+from torch.utils.data import DataLoader, Dataset
+import torch
+import h5py
+import os 
+from pathlib import Path
+
+# ✅ IMPORT CONFIGURATION (Must be in same directory or project root)
+import VAE_configuration as Params
+
+# ==============================================================================
+# 1. PEPTIDE DATASET CLASS (Preserved Exactly)
+# ==============================================================================
+class Peptide_dataset(Dataset):
+    def __init__(self, df, has_label=True):
+        self.df = df.reset_index(drop=True)
+        self.has_label = has_label
+        self.token = Params.dataset_params['token']
+        self.max_len = Params.dataset_params['max_seq_len']
+        
+    def __tokenize__(self, seq):
+        token = self.token
+        # Ensure seq is string and truncate to max_len
+        seq_str = str(seq)[:self.max_len]
+        seq_list = [token['start']]
+        for letter in seq_str:
+            seq_list.append(token.get(letter.strip(), token['unk']))
+        seq_list.append(token['eos'])
+        return torch.tensor(seq_list, dtype=torch.long)
+    
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        seq_token = self.__tokenize__(self.df.iloc[idx]['seq'])
+        if self.has_label and 'label' in self.df.columns:
+            try:
+                label_val = float(self.df.iloc[idx]['label'])
+                label = torch.tensor(label_val, dtype=torch.float32)  # ✅ FIX: Uses actual value
+            except Exception as e:
+                print(f"Warning: Error reading label at index {idx}: {e}")
+                label = torch.tensor(0.0, dtype=torch.float32)
+            return seq_token, label
+        return seq_token
+
+# ==============================================================================
+# 2. SAFE COLLATE FUNCTION (Critical for Variable-Length Sequences)
+# ==============================================================================
+PAD_IDX = Params.dataset_params['token']['pad']
+
+def safe_collate(batch):
+    """Handles variable-length peptide sequences with padding."""
+    # Check if batch contains labels or just sequences
+    if isinstance(batch[0], tuple):
+        seqs, labels = zip(*batch)
+        labels = torch.stack(labels)
+    else:
+        seqs = batch
+        labels = None
+        
+    lengths = torch.tensor([len(s) for s in seqs])
+    padded = torch.nn.utils.rnn.pad_sequence(seqs, batch_first=True, padding_value=PAD_IDX)
+    
+    if labels is not None:
+        return padded, labels
+    return padded
+
+# ==============================================================================
+# 3. ENCODING FUNCTIONS (Preserved Exactly)
+# ==============================================================================
+def save_train_encodings(data_path, model_PATH, param, filename, save_folder):
+    """Encode labeled peptides and save latent vectors + labels to HDF5."""
+    
+    # Verify paths exist
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Data file not found: {data_path}")
+    if not os.path.exists(model_PATH):
+        raise FileNotFoundError(f"Model checkpoint not found: {model_PATH}")
+        
+    os.makedirs(save_folder, exist_ok=True)
+    hdf5_path = os.path.join(save_folder, f"{filename}.h5")
+    
+    # Load model safely
+    from model.model import RNN_VAE
+    MP = param.RNN_VAE_params
+    model = RNN_VAE(**MP).to(param.device)
+    state_dict = torch.load(model_PATH, map_location=param.device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    
+    # Create dataset and dataloader with safe collate
+    df = pd.read_csv(data_path, keep_default_na=False)
+    dataset = Peptide_dataset(df, has_label=True)
+    dataloader = DataLoader(dataset, batch_size=512, shuffle=False, collate_fn=safe_collate)
+    
+    print(f"Encoding {len(df)} sequences from {os.path.basename(data_path)}...")
+    
+    # Open HDF5 once before loop (fixes performance + corruption issues)
+    with h5py.File(hdf5_path, 'w') as hf:
+        first_batch = True
+        for idx, (seq_tokens, labels) in enumerate(dataloader):
+            with torch.no_grad():
+                (z_mu, z_logvar), z, dec_logits = model(seq_tokens.to(param.device))
+                
+            z_np = z_mu.cpu().numpy()
+            labels_np = labels.cpu().numpy().reshape(-1, 1)
+            data = np.concatenate([z_np, labels_np], axis=1)
+            
+            if first_batch:
+                hf.create_dataset('data', data=data, compression="gzip", 
+                                chunks=True, maxshape=(None, data.shape[1]))
+                first_batch = False
+            else:
+                N_z = z_np.shape[0]
+                hf['data'].resize(hf['data'].shape[0] + N_z, axis=0)
+                hf['data'][-N_z:] = data
+                
+            if (idx + 1) % 10 == 0:
+                print(f"  Processed batch {idx+1}/{len(dataloader)} | "
+                      f"Total encoded: {hf['data'].shape[0]}")
+    
+    # Verify output
+    with h5py.File(hdf5_path, 'r') as hf:
+        final_shape = hf['data'].shape
+    print(f"✅ Saved encodings to {hdf5_path} | Shape: {final_shape}")
+    return final_shape
+
+
+def get_seq_encodings(seqs, model_PATH, param):
+    """Encode raw sequence strings directly (no CSV needed)."""
+    
+    if not os.path.exists(model_PATH):
+        raise FileNotFoundError(f"Model checkpoint not found: {model_PATH}")
+        
+    df = pd.DataFrame({'seq': seqs})
+    dataset = Peptide_dataset(df, has_label=False)
+    
+    from model.model import RNN_VAE
+    MP = param.RNN_VAE_params
+    model = RNN_VAE(**MP).to(param.device)
+    state_dict = torch.load(model_PATH, map_location=param.device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    
+    dataloader = DataLoader(dataset, batch_size=512, shuffle=False, collate_fn=safe_collate)
+    
+    z_final = []
+    for idx, seq_tokens in enumerate(dataloader):
+        with torch.no_grad():
+            (z_mu, z_logvar), z, dec_logits = model(seq_tokens.to(param.device))
+            z_final.append(z_mu.cpu().numpy())
+    
+    z_final = np.concatenate(z_final, axis=0)
+    print(f"✅ Encoded {len(z_final)} sequences | Shape: {z_final.shape}")
+    return z_final, df
+
+
+def enc2seq(encodings, model_PATH, param):
+    """Decode latent vectors back to peptide sequences."""
+    
+    if not os.path.exists(model_PATH):
+        raise FileNotFoundError(f"Model checkpoint not found: {model_PATH}")
+        
+    encodings_tensor = torch.tensor(encodings, dtype=torch.float32, device=param.device)
+    
+    from model.model import RNN_VAE
+    MP = param.RNN_VAE_params
+    model = RNN_VAE(**MP).to(param.device)
+    state_dict = torch.load(model_PATH, map_location=param.device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    
+    with torch.no_grad():
+        tokens_sampled = model.sampling_sequences_shift(encodings_tensor)
+    
+    print(f"✅ Decoded {tokens_sampled.shape[0]} sequences")
+    return tokens_sampled
+
+
+# ==============================================================================
+# 4. MAIN EXECUTION BLOCK (Portable Paths)
+# ==============================================================================
+if __name__ == '__main__':
+    # ✅ PORTABLE PATH CONFIGURATION
+    # Dynamically finds the project root relative to THIS script
+    PROJECT_ROOT = Path(__file__).resolve().parent
+    
+    SAVE_DIR = PROJECT_ROOT / 'mh_models'
+    LABELED_CSV = PROJECT_ROOT / 'binder_lab.csv'
+    MODEL_CKPT = PROJECT_ROOT / 'model_best.ckpt' 
+    
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    
+    print("="*60)
+    print("GENERATING LABELED BINDINGS ENCODINGS FOR MH SAMPLER")
+    print("="*60)
+    print(f"📂 Project Root: {PROJECT_ROOT}")
+    print(f" Labeled CSV: {LABELED_CSV}")
+    print(f"💾 Model Checkpoint: {MODEL_CKPT}")
+    print(f"💾 Output Folder: {SAVE_DIR}")
+    print("="*60)
+    
+    # Generate encodings for q(c|z) classifier training
+    save_train_encodings(
+        data_path=str(LABELED_CSV),
+        model_PATH=str(MODEL_CKPT),
+        param=Params,
+        filename="binder_lab_encodings",
+        save_folder=str(SAVE_DIR)
+    )
+    
+    print("\n" + "="*60)
+    print("NEXT STEP: Run train_qcz.py to train classifier ensembles")
+    print("="*60)
