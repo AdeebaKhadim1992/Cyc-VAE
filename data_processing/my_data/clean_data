@@ -1,1 +1,188 @@
 
+import pandas as pd
+import numpy as np
+import sys
+from pathlib import Path
+
+# ==============================================================================
+# 1. PORTABLE PATH CONFIGURATION
+# ==============================================================================
+PROJECT_ROOT = Path(__file__).resolve().parent
+print(f" Project Root: {PROJECT_ROOT}")
+
+# Define input/output paths relative to project root
+IN_FOLDER = PROJECT_ROOT / "content"
+OUT_FOLDER = PROJECT_ROOT
+FILE_1000VALID_PATH = IN_FOLDER / "datasetbinder.csv"
+UNIPROT_FILE_PATHS = [IN_FOLDER / "uniprot.csv"]
+
+# ==============================================================================
+# 2. HELPER FUNCTIONS (Preserved Exactly)
+# ==============================================================================
+def add_label_to_csvfile(in_file, coln_name, label):
+    df = pd.read_csv(str(in_file))
+    if 'Sequence' in df.columns and 'seq' not in df.columns:
+        df.rename(columns={'Sequence': 'seq'}, inplace=True)
+        print("Renamed 'Sequence' -> 'seq'")
+    
+    n_rows = df.shape[0]
+    if coln_name in df.columns:
+        print(f"Column '{coln_name}' already exists. Overwriting with value {label}")
+        df[coln_name] = label
+    else:
+        df.insert(df.shape[1], coln_name, [label] * n_rows)
+    return df
+
+def filter_delta_G(df, th):
+    if 'dG_cross' not in df.columns:
+        print(f"WARNING: 'dG_cross' column not found. Available: {df.columns.tolist()}")
+        return df
+    return df[df['dG_cross'] <= th]
+
+def keep_colns_csv_file(df, coln_name_keep):
+    return df[coln_name_keep]
+
+def uniprot_df(file_path, label):
+    seqs = []
+    with open(str(file_path), 'r') as file_ID:
+        for idx, line in enumerate(file_ID.readlines()):
+            if ' ' not in line:
+                seqs.append([line.strip('\n'), label])
+    df = pd.DataFrame(seqs, columns=['seq', 'IC_50'])
+    return df
+
+def process_label_uniprot_data_to_csv(file_paths, label):
+    dfs = [uniprot_df(file, label=label) for file in file_paths]
+    concat_df = pd.concat(dfs)
+    return concat_df
+
+def random_slice(seq, window_size_range):
+    if len(seq) < window_size_range[-1]:
+        window_size_range = np.arange(2, len(seq)+1)
+    ws = np.random.choice(window_size_range, 1)[0]
+    start_pos = np.random.choice(len(seq)-ws+1)
+    sliced_seq = seq[start_pos:start_pos+ws]
+    return sliced_seq
+
+def slicing_thpdb(df, previous_existing_seqs, window_size_range, N_number):
+    all_seqs = list(df['seq'])
+    existing_seqs = []
+    while len(existing_seqs) < N_number:
+        seq_to_slice = np.random.choice(all_seqs, 1)[0]
+        sliced_seq = random_slice(seq_to_slice, window_size_range)
+        if sliced_seq not in existing_seqs + previous_existing_seqs:
+            existing_seqs.append(sliced_seq)
+    new_df = pd.DataFrame({'seq': existing_seqs})
+    return new_df
+
+def combine_all_csv_files(dfs):
+    return pd.concat(dfs)
+
+def get_length_less_than(df, th):
+    return df[df['seq'].apply(lambda x: isinstance(x, str) and len(x) <= th)]
+
+def get_length_greater_than(df, th):
+    return df[df['seq'].apply(lambda x: isinstance(x, str) and len(x) >= th)]
+
+def replace_with_x(Str):
+    Str_result = ''
+    for c in Str:
+        if c.islower():
+            c = 'x'
+        Str_result += c
+    return Str_result
+
+def replace_synthetic_with_x(df):
+    func = lambda x: replace_with_x(x)
+    new_seq = df['seq'].apply(func)
+    df = df.drop(['seq'], axis=1)
+    df.insert(0, 'seq', new_seq)
+    return df
+
+def add_label_to_df(df, coln_name, label):
+    n_rows = df.shape[0]
+    df.insert(df.shape[1], coln_name, [label]*n_rows)
+    return df
+
+# ==============================================================================
+# 3. MAIN EXECUTION PIPELINE
+# ==============================================================================
+if __name__ == '__main__':
+    # Validate input files exist before processing
+    if not FILE_1000VALID_PATH.exists():
+        raise FileNotFoundError(f"Base binder file not found at: {FILE_1000VALID_PATH}")
+    
+    # Load and standardize base binder data
+    db_df = pd.read_csv(str(FILE_1000VALID_PATH))
+    if 'Sequence' in db_df.columns and 'seq' not in db_df.columns:
+        db_df.rename(columns={'Sequence': 'seq'}, inplace=True)
+    
+    if 'label' not in db_df.columns:
+        db_df['label'] = 1
+    else:
+        print(f"'label' column already exists with {db_df['label'].nunique()} unique values")
+    
+    if 'dG_cross' in db_df.columns:
+        db_df = filter_delta_G(db_df, -35)
+    
+    cols_to_keep = ['seq', 'label']
+    if 'IC_50' in db_df.columns:
+        cols_to_keep.append('IC_50')
+    db_df = keep_colns_csv_file(db_df, cols_to_keep)
+    
+    db_df = db_df.dropna(subset=['seq'])
+    db_df = db_df[db_df['seq'].apply(lambda x: isinstance(x, str))]
+    db_df = get_length_greater_than(db_df, th=2)
+    
+    print(f"Loaded {len(db_df)} base sequences from datasetbinder.csv")
+    print(f"Columns: {db_df.columns.tolist()}")
+
+    # Fragment augmentation for positive samples
+    window_size_range = np.arange(5, 41)
+    N_seqs_per_boot = 10000
+    previous_existing_seqs = []
+    label_dfs = []
+
+    for repeat in range(4):
+        frag_df = slicing_thpdb(db_df, previous_existing_seqs, window_size_range, N_number=N_seqs_per_boot)
+        previous_existing_seqs.extend(list(frag_df['seq']))
+        frag_df = add_label_to_df(frag_df, 'IC_50', 1)
+        label_dfs.append(frag_df)
+        print(f"Bootstrap {repeat+1}/4: Generated {len(frag_df)} unique fragments")
+
+    labeled_seqs = list(combine_all_csv_files(label_dfs)['seq'])
+    print(f"\n✅ Total augmented positive fragments: {len(labeled_seqs)}")
+
+    # Process UniProt negatives
+    valid_uniprot_paths = [p for p in UNIPROT_FILE_PATHS if p.exists()]
+    if not valid_uniprot_paths:
+        raise FileNotFoundError(f"No UniProt files found at: {UNIPROT_FILE_PATHS}")
+        
+    uniprot_df = process_label_uniprot_data_to_csv(valid_uniprot_paths, label=0)
+    uniprot_df = get_length_less_than(uniprot_df, th=50)
+    uniprot_df = get_length_greater_than(uniprot_df, th=2)
+    uniprot_df = uniprot_df.drop_duplicates(subset="seq", keep='first')
+    print(f"Loaded {len(uniprot_df)} unique UniProt sequences")
+
+    # Generate balanced negative set
+    negative_seqs = []
+    while len(negative_seqs) <= N_seqs_per_boot * 4:
+        uniprot_df_sampled = slicing_thpdb(uniprot_df, negative_seqs, window_size_range, N_number=100)
+        sampled_list = list(set(list(uniprot_df_sampled['seq'])) - set(labeled_seqs) - set(negative_seqs))
+        negative_seqs.extend(sampled_list)
+        print(f'len(negative_seqs): {len(negative_seqs)}')
+    
+    negative_seqs = negative_seqs[:N_seqs_per_boot*4]
+    uniprot_df_sampled = pd.DataFrame({'seq': negative_seqs, 'IC_50': [0]*len(negative_seqs)})
+
+    # Combine, clean, and save labeled dataset
+    labeled_dfs = combine_all_csv_files([uniprot_df_sampled] + label_dfs)
+    print(f'Total labeled data number: {len(labeled_dfs)}')
+    
+    labeled_dfs = replace_synthetic_with_x(labeled_dfs)
+    labeled_dfs = labeled_dfs.drop_duplicates(subset="seq", keep='first')
+    
+    OUTPUT_LABELED = OUT_FOLDER / "binder_lab.csv"
+    labeled_dfs.to_csv(str(OUTPUT_LABELED), index=False)
+    print(f"✅ Saved labeled dataset to: {OUTPUT_LABELED}")
+    print(f"Final labeled dataset size: {len(labeled_dfs)}")
