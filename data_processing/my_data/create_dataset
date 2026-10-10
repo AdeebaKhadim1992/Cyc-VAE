@@ -1,0 +1,247 @@
+# coding: utf-8
+import json
+import pandas as pd
+import glob
+import os
+from pathlib import Path
+import numpy as np
+import sys
+
+# ==============================================================================
+# 1. PORTABLE PATH CONFIGURATION
+# ==============================================================================
+PROJECT_ROOT = Path(__file__).resolve().parent
+print(f"📂 Project Root: {PROJECT_ROOT}")
+
+STANDARD_AAS = set("ACDEFGHIKLMNPQRSTVWY")
+
+# Define input/output paths relative to project root
+BINDER_CSV_PATH = PROJECT_ROOT / "binder.csv"
+UNIPROT_CSV_PATH = PROJECT_ROOT / "uniprot.csv"
+JSON_OUTPUT_DIR = PROJECT_ROOT / "dbaasp_custom"
+LABELED_OUTPUT = PROJECT_ROOT / "binder_lab_.csv"
+UNLABELED_OUTPUT = PROJECT_ROOT / "binder_unlab_.csv"
+
+# ==============================================================================
+# 2. HELPER FUNCTIONS (Preserved Exactly)
+# ==============================================================================
+def is_valid_sequence(seq_str):
+    """Check if a sequence contains only natural AAs and is within length limits."""
+    if not seq_str or not isinstance(seq_str, str):
+        return False
+    seq_clean = seq_str.strip().upper()
+    if len(seq_clean) < 5 or len(seq_clean) > 80:
+        return False
+    if not all(aa in STANDARD_AAS for aa in seq_clean):
+        return False
+    return True
+
+def apply_rigorous_filters(df_temp):
+    """Applies rigorous filtering logic for peptide sequences."""
+    if df_temp.empty: 
+        return df_temp
+    
+    # 1. Must start with uppercase letters
+    df_temp = df_temp[df_temp['seq'].str.contains('^[A-Z]+', na=False)]
+    # 2. Remove non-natural amino acids
+    for char in ["B", "J", "O", "U", "X", "Z"]:
+        df_temp = df_temp[~df_temp.seq.str.contains(char, na=False)]
+    # 3. Remove lowercase letters
+    df_temp = df_temp[~df_temp.seq.str.contains('[a-z]', na=False)]
+    # 4. Remove hyphens and numbers
+    df_temp = df_temp[~df_temp.seq.str.contains("-", na=False)]
+    df_temp = df_temp[~df_temp.seq.str.contains(r'[0-9]', na=False)]
+    
+    return df_temp
+
+def convert_csv_to_json_if_needed(csv_path, output_folder):
+    """Converts binder CSV to JSON files mimicking DBAASP structure if JSONs are missing."""
+    json_files = glob.glob(os.path.join(output_folder, "*.json"))
+    if json_files:
+        print(f"Found {len(json_files)} existing JSON files in {output_folder}. Skipping conversion.")
+        return
+
+    if not csv_path.exists():
+        print(f"Warning: {csv_path} not found. Skipping JSON conversion.")
+        return
+
+    print(f"No JSON files found in {output_folder}. Converting {csv_path} to JSONs...")
+    os.makedirs(output_folder, exist_ok=True)
+
+    df = pd.read_csv(str(csv_path))
+    
+    # Identify columns dynamically
+    seq_col = None
+    for col in ['seq', 'Sequence', 'sequence', 'Seq']:
+        if col in df.columns:
+            seq_col = col
+            break
+    if seq_col is None:
+        seq_col = df.columns[0]
+
+    count = 0
+    for index, row in df.iterrows():
+        seq = str(row[seq_col]).strip().upper()
+        if not seq or len(seq) < 5: 
+            continue
+
+        json_data = {
+            "seq": [seq],
+            "peptideCard": {"unusualAminoAcids": None},
+            "nTerminus": ["#"],
+            "cTerminus": ["#"],
+            "targetActivities": []
+        }
+
+        filepath = output_folder / f"peptide_{index}.json"
+        with open(filepath, 'w') as f:
+            json.dump(json_data, f)
+        count += 1
+
+    print(f"Converted {count} sequences to JSON in {output_folder}.")
+
+def get_valid_sequences_dbaasp_fast(json_folder):
+    """Extracts ALL valid sequences from DBAASP/Custom JSONs for Unlabeled Pre-training."""
+    peptides_list_all = []
+    json_files = glob.glob(os.path.join(json_folder, "*.json"))
+    print(f"Found {len(json_files)} JSON files in {json_folder}...")
+
+    count_skipped_unusual = 0
+    count_skipped_invalid = 0
+
+    for j_file in json_files:
+        try:
+            with open(j_file, 'r') as f:
+                data = json.load(f)
+
+            if data.get("peptideCard", {}).get("unusualAminoAcids") is not None:
+                count_skipped_unusual += 1
+                continue
+
+            raw_seq_list = data.get("seq", [])
+            seq = raw_seq_list[0] if isinstance(raw_seq_list, list) else raw_seq_list
+
+            if isinstance(seq, str):
+                seq_upper = seq.upper().strip()
+                if 5 <= len(seq_upper) <= 40 and all(aa in STANDARD_AAS for aa in seq_upper):
+                    peptides_list_all.append({"seq": seq_upper})
+                else:
+                    count_skipped_invalid += 1
+        except Exception:
+            continue
+
+    df_all = pd.DataFrame(peptides_list_all).drop_duplicates(subset=['seq']) if peptides_list_all else pd.DataFrame(columns=['seq'])
+
+    print(f"Extracted {len(df_all)} unique valid sequences from JSONs.")
+    print(f"Skipped {count_skipped_unusual} due to unusual AAs.")
+    print(f"Skipped {count_skipped_invalid} due to invalid length/chars.")
+    return df_all
+
+# ==============================================================================
+# 3. MAIN EXECUTION PIPELINE
+# ==============================================================================
+if __name__ == '__main__':
+    print('Dataset Creation process begins ... ')
+
+    # --- STEP 0: CONVERT CSV TO JSON IF NEEDED ---
+    print('\n**** Step 0: Checking/Converting Binder Data to JSON ****')
+    convert_csv_to_json_if_needed(BINDER_CSV_PATH, JSON_OUTPUT_DIR)
+
+    # --- STEP 1: PROCESS DBAASP/CUSTOM JSONS ---
+    print('\n**** Step 1: Processing JSONs for Unlabeled Data ****')
+    df_dbaasp_all = get_valid_sequences_dbaasp_fast(str(JSON_OUTPUT_DIR))
+
+    # --- STEP 2: PROCESS BINDER DATASET ---
+    print('\n**** Step 2: Processing Binder Dataset ****')
+    if not BINDER_CSV_PATH.exists():
+        raise FileNotFoundError(f"Binder file not found at: {BINDER_CSV_PATH}")
+
+    print(f"Loading binder data from: {BINDER_CSV_PATH}")
+    df_binder = pd.read_csv(str(BINDER_CSV_PATH))
+    print(f"Columns found: {df_binder.columns.tolist()}")
+
+    # Auto-detect sequence and label columns
+    seq_col = next((c for c in ['seq', 'Sequence', 'sequence', 'Seq', 'Peptide'] if c in df_binder.columns), df_binder.columns[0])
+    label_col = next((c for c in ['label', 'Label', 'activity', 'Activity', 'class'] if c in df_binder.columns), None)
+    
+    if label_col is None:
+        raise ValueError(f"Could not find a 'label' column. Available: {df_binder.columns.tolist()}")
+
+    df_binder = df_binder.rename(columns={seq_col: 'seq', label_col: 'label'})[['seq', 'label']]
+    df_binder['seq'] = df_binder['seq'].astype(str).str.upper().str.strip()
+    df_binder = df_binder[df_binder['seq'].apply(is_valid_sequence)]
+    df_binder['label'] = pd.to_numeric(df_binder['label'], errors='coerce').dropna().astype(int)
+
+    binder_pos = df_binder[df_binder['label'] == 1][['seq']].copy()
+    binder_neg = df_binder[df_binder['label'] == 0][['seq']].copy()
+    binder_pos['source'] = 'binder_pos'
+    binder_neg['source'] = 'binder_neg'
+    
+    print(f"Binder Positives: {len(binder_pos)}, Negatives: {len(binder_neg)}")
+
+    # --- STEP 3: LOAD UNIPROT ---
+    print('\n**** Step 3: Loading Uniprot ****')
+    uniprot_unk = pd.DataFrame(columns=['seq'])
+    uniprot_neg = pd.DataFrame(columns=['seq', 'source'])
+
+    if UNIPROT_CSV_PATH.exists():
+        df_uniprot_raw = pd.read_csv(str(UNIPROT_CSV_PATH))
+        seq_col_name = next((c for c in ['seq', 'Sequence', 'sequence', 'Seq'] if c in df_uniprot_raw.columns), df_uniprot_raw.columns[0])
+        df_uniprot_raw = df_uniprot_raw.rename(columns={seq_col_name: 'seq'})[['seq']].dropna()
+        df_uniprot_raw['seq'] = df_uniprot_raw['seq'].astype(str).str.upper().str.strip()
+        
+        uniprot_unk = df_uniprot_raw[df_uniprot_raw['seq'].apply(is_valid_sequence)]
+        uniprot_unk = uniprot_unk[uniprot_unk['seq'].str.len() <= 50].drop_duplicates(subset=['seq'])
+        
+        uniprot_neg = uniprot_unk.copy()
+        uniprot_neg['source'] = 'uniprot_neg'
+        print(f"Loaded {len(uniprot_neg)} valid Uniprot negatives.")
+    else:
+        print(f"️ Uniprot file not found at: {UNIPROT_CSV_PATH}. Skipping.")
+
+    # --- STEP 4: COMBINE LABELED DATA ---
+    print('\n**** Step 4: Combining Labeled Datasets ****')
+    amp_pos = apply_rigorous_filters(binder_pos).drop_duplicates(subset=['seq'])
+    combined_neg = pd.concat([binder_neg, uniprot_neg]).drop_duplicates(subset=['seq'])
+    
+    # Conflict resolution
+    common = amp_pos.merge(combined_neg, on=['seq'], how='inner')
+    if len(common) > 0:
+        print(f"Removing {len(common)} conflicting sequences.")
+        combined_neg = combined_neg[~combined_neg['seq'].isin(common['seq'])]
+    
+    combined_neg = apply_rigorous_filters(combined_neg)
+    print(f"Final Positives: {len(amp_pos)}, Negatives: {len(combined_neg)}")
+
+    # --- STEP 5: CREATE LABELED VAE DATASET ---
+    print('\n**** Step 5: Creating binder_lab_.csv ****')
+    amp_pos['label'] = 1
+    combined_neg['label'] = 0
+    
+    final_df = pd.concat([amp_pos[['seq', 'label']], combined_neg[['seq', 'label']]]).drop_duplicates(subset=['seq'])
+    final_df = final_df.sample(frac=1).reset_index(drop=True)
+    final_df['text'] = final_df['seq'].apply(lambda x: " ".join(list(x)))
+    final_df[['text', 'label']].to_csv(str(LABELED_OUTPUT), index=False)
+    print(f"✅ Saved {len(final_df)} sequences to {LABELED_OUTPUT.name}")
+
+    # --- STEP 6: CREATE UNLABELED VAE DATASET ---
+    print('\n**** Step 6: Creating binder_unlab_.csv ****')
+    df_unlabeled = pd.concat([
+        df_dbaasp_all, 
+        uniprot_unk[['seq']], 
+        binder_pos[['seq']], 
+        binder_neg[['seq']]
+    ]).drop_duplicates(subset=['seq'])
+    
+    df_unlabeled = df_unlabeled[df_unlabeled['seq'].str.len().between(5, 80)]
+    df_unlabeled = apply_rigorous_filters(df_unlabeled)
+    
+    if not df_unlabeled.empty:
+        df_unlabeled['text'] = df_unlabeled['seq'].apply(lambda x: " ".join(list(x)))
+        df_unlabeled['source'] = 'unlabeled'
+        df_unlabeled[['seq', 'source']].to_csv(str(UNLABELED_OUTPUT), index=False)
+        print(f"✅ Saved {len(df_unlabeled)} sequences to {UNLABELED_OUTPUT.name}")
+    else:
+        print("⚠️ No unlabeled sequences found after filtering.")
+
+    print("\n🎉 Dataset creation complete!")
