@@ -1,0 +1,68 @@
+import pandas as pd
+import json
+import os
+from pathlib import Path
+
+# ==============================================================================
+# 1. PORTABLE PATH CONFIGURATION
+# ==============================================================================
+PROJECT_ROOT = Path(__file__).resolve().parent
+print(f"📂 Project Root: {PROJECT_ROOT}")
+
+# Define input/output paths relative to project root
+DBAASP_CSV_PATH = PROJECT_ROOT / "dbaasp.csv"
+OUTPUT_DIR = PROJECT_ROOT / "dbaasp"
+
+# ==============================================================================
+# 2. AUTO-DETECT SEQUENCE COLUMN & CONVERT TO JSON
+# ==============================================================================
+if not DBAASP_CSV_PATH.exists():
+    raise FileNotFoundError(
+        f"DBAASP CSV file not found at: {DBAASP_CSV_PATH}\n"
+        "Please place 'dbaasp.csv' in the project root directory."
+    )
+
+df = pd.read_csv(str(DBAASP_CSV_PATH))
+
+# Auto-detect sequence column name (case-insensitive search)
+possible_names = ['Sequence', 'sequence', 'Peptide Sequence', 
+                  'peptide_sequence', 'seq', 'SEQUENCE']
+seq_col = None
+for name in possible_names:
+    if name in df.columns:
+        seq_col = name
+        break
+
+if seq_col is None:
+    print(f"❌ ERROR: Could not find sequence column.")
+    print(f"   Available columns: {df.columns.tolist()}")
+    print("   Please rename your sequence column to one of: {possible_names}")
+else:
+    print(f"✅ Found sequence column: '{seq_col}'")
+
+    # Create output directory
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # Convert each row to JSON
+    count = 0
+    for index, row in df.iterrows():
+        seq = str(row[seq_col]).strip()
+
+        # Skip empty sequences or NaN values
+        if not seq or seq.lower() == 'nan':
+            continue
+
+        peptide_data = {
+            "seq": [seq],
+            "peptideCard": {"unusualAminoAcids": None},
+            "nTerminus": ["#"],
+            "cTerminus": ["#"],
+            "targetActivities": []
+        }
+
+        filename = OUTPUT_DIR / f"peptide_{index}.json"
+        with open(filename, 'w') as f:
+            json.dump(peptide_data, f)
+        count += 1
+
+    print(f"✅ Successfully converted {count} peptides to JSON files in {OUTPUT_DIR}")
