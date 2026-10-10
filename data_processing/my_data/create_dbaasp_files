@@ -1,0 +1,71 @@
+import pandas as pd
+import json
+import os
+from pathlib import Path
+
+def csv_to_dbaasp_json(csv_path, output_folder="./dbaasp_from_csv"):
+    """
+    Converts a CSV file with 'seq' and 'label' columns into
+    individual JSON files mimicking the DBAASP structure.
+    """
+    # 1. Load CSV
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    df = pd.read_csv(str(csv_path))
+
+    # Ensure standard column names
+    if 'Sequence' in df.columns:
+        df = df.rename(columns={'Sequence': 'seq'})
+    if 'Label' in df.columns:
+        df = df.rename(columns={'Label': 'label'})
+
+    if 'seq' not in df.columns:
+        raise ValueError("CSV must have a 'seq' or 'Sequence' column.")
+
+    # 2. Create Output Folder
+    os.makedirs(output_folder, exist_ok=True)
+    print(f"Converting {len(df)} sequences to JSON in {output_folder}...")
+
+    # 3. Convert each row to a JSON file
+    count = 0
+    for index, row in df.iterrows():
+        seq = str(row['seq']).strip().upper()
+        label = row.get('label', 1)  # Default to 1 if no label
+
+        # Skip invalid sequences
+        if not seq or len(seq) < 5:
+            continue
+
+        # Create DBAASP-like structure
+        json_data = {
+            "seq": [seq],
+            "peptideCard": {"unusualAminoAcids": None},
+            "nTerminus": ["#"],
+            "cTerminus": ["#"],
+            "targetActivities": []
+        }
+
+        # Save as individual JSON file
+        filename = f"peptide_{index}.json"
+        filepath = os.path.join(output_folder, filename)
+
+        with open(filepath, 'w') as f:
+            json.dump(json_data, f, indent=2)
+        
+        count += 1
+
+    print(f"Done! Created {count} JSON files in {output_folder}.")
+
+
+if __name__ == "__main__":
+    # ✅ PORTABLE PATH CONFIGURATION
+    PROJECT_ROOT = Path(__file__).resolve().parent
+    CSV_PATH = PROJECT_ROOT / "binder.csv"
+    OUTPUT_DIR = PROJECT_ROOT / "dbaasp_custom"
+    
+    try:
+        csv_to_dbaasp_json(CSV_PATH, OUTPUT_DIR)
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        print(f"   Ensure 'binder.csv' exists at: {CSV_PATH}")
