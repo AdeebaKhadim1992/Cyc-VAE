@@ -1,0 +1,102 @@
+import torch
+import os
+from pathlib import Path
+
+# ==============================================================================
+# 1. PORTABLE DEVICE & PATH CONFIGURATION
+# ==============================================================================
+PROJECT_ROOT = Path(__file__).resolve().parent
+print(f"📂 Project Root: {PROJECT_ROOT}")
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# ==============================================================================
+# 2. UNIFIED TOKENIZATION (MUST MATCH TRAINING SCRIPT EXACTLY)
+# ==============================================================================
+AMINO_ACIDS = list("ACDEFGHIKLMNPQRSTVWY")
+
+token = {
+    'unk': 0,
+    'pad': 1,
+    'start': 2,
+    'eos': 3,
+}
+
+for i, aa in enumerate(AMINO_ACIDS):
+    token[aa] = i + 4
+
+token_reverse = {v: k for k, v in token.items()}
+
+# ==============================================================================
+# 3. DATASET PARAMETERS (Portable Paths)
+# ==============================================================================
+dataset_params = {
+    # ✅ Relative path - works on any system
+    'data_path': str(PROJECT_ROOT / "binder_unlab_.csv"), 
+    'max_seq_len': 35,                  
+    'train_eval_ratio': 0.8,
+    'token': token,                     
+    'vocab_size': len(token),           # 24
+}
+
+# ==============================================================================
+# 4. MODEL HYPERPARAMETERS (MATCHES model_best.ckpt ARCHITECTURE)
+# ==============================================================================
+RNN_VAE_params = {
+    'n_vocab': 24,          
+    'max_seq_len': 35,
+    'z_dim': 256,           
+    'emb_dim': 50,          
+    'PAD_IDX': 1,
+    'device': device,       
+    'GRUEncoder_params': {
+        'h_dim': 256,       
+        'biGRU': True,      
+        'layers': 2,       
+        'p_dropout': 0.2
+    },
+    'GRUDecoder_params': {
+        'h_dim': 256,       
+        'p_word_dropout': 0.1,
+        'p_out_dropout': 0.2,
+        'skip_connections': False  # ✅ Fixed typo: was 'skip_connetions'
+    }
+}
+
+# ==============================================================================
+# 5. TRAINING PARAMETERS (Kept for consistency)
+# ==============================================================================
+training_params = {
+    'epochs': 50,
+    'lr': 1e-3,
+    'train_batch_size': 64,
+    'test_batch_size': 64,
+    'shuffle': True,
+    # ✅ Relative path for saving models
+    'model_save_folder': str(PROJECT_ROOT / "models" / "vae_pretrain")
+}
+
+# ==============================================================================
+# 6. LOSS WEIGHTS & ANNEALING
+# ==============================================================================
+loss_weights = {
+    'recon': 1.0,
+    'pz': 1.0, 
+    'lambda_logvar_L1': 0.0,
+    'lambda_logvar_KL': 0.0,
+    'beta': {
+        'val': [0.0, 1.0],   
+        'iter': [0, 1000]    
+    }
+}
+
+# ==============================================================================
+# 7. LOGGING & MISC
+# ==============================================================================
+log_results = True
+Result_root = str(PROJECT_ROOT / "results")
+debug = False
+resume_train = False
+use_kl = True
+extension_dataset_params = dataset_params
