@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent  # Adjust if script is nes
 
 MODEL_PATH = PROJECT_ROOT / 'model_best.ckpt'
 LABELLED_CSV = PROJECT_ROOT / 'binder_lab.csv'
-ENCODINGS_H5 = PROJECT_ROOT / 'mh_results' / 'label_extension13_train_beta.h5'
+ENCODINGS_H5 = PROJECT_ROOT / 'mh_results' / 'binder_unlabeled_encodings.h5''
 
 MH_OUTPUT_DIR = PROJECT_ROOT / 'output' / 'default'
 SAMPLED_SEQ_FILE = MH_OUTPUT_DIR / 'len_4_det.txt'
