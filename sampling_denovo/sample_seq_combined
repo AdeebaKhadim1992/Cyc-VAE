@@ -1,216 +1,214 @@
-import sys
 import os
+import sys
 import pickle
 import numpy as np
+import pandas as pd
 import h5py
 import torch
 from pathlib import Path
-from torch.utils.data import DataLoader, Dataset
 
 # ==============================================================================
-# 1. SETUP PATHS & CONFIGURATION (Portable)
+# 1. PORTABLE PROJECT SETUP & PATHS
 # ==============================================================================
-# Dynamically locate project root relative to THIS script
 PROJECT_ROOT = Path(__file__).resolve().parent
 print(f"📂 Project Root: {PROJECT_ROOT}")
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Import pipeline modules (adjust import path if you move this script to a subfolder)
+# Import local modules
 try:
     from train_sampling_models import train_qcz, train_qz
     from sample_seqs_revise import sampling_seqs
-except ImportError:
-    raise ImportError("Ensure 'train_sampling_models.py' and 'sample_seqs_revise.py' are in the project root or sys.path")
+    import VAE_configuration as Params
+    from model.model import RNN_VAE
+except ImportError as e:
+    raise ImportError(f"Failed to import required modules. Ensure all dependencies are installed and paths are correct: {e}")
 
-import VAE_configuration as Params
+# Define key directories and files using relative paths
+MH_MODELS_FOLDER = PROJECT_ROOT / 'mh_models'
+RESULTS_FOLDER = PROJECT_ROOT / 'mh_results'
+MODEL_CKPT = PROJECT_ROOT / 'model_best.ckpt'
 
-# Import VAE model architecture
-# Adjust this import path based on where your trained model file resides
-try:
-    from vae_extension.results.con_13.model_file import RNN_VAE
-except ImportError:
-    try:
-        from model.model import RNN_VAE
-        print("⚠️ Loaded RNN_VAE from model/model.py instead of vae_extension/")
-    except ImportError:
-        raise ImportError("Could not find RNN_VAE. Check model file location.")
+LABELED_ENC_PATH = MH_MODELS_FOLDER / 'binder_lab_encodings.h5'
+UNLABELED_ENC_PATH = MH_MODELS_FOLDER / 'binder_unlabeled_encodings.h5'
+LABELED_DATA_PATH = PROJECT_ROOT / 'binder_lab.csv'
+LABELED_ENC_PREFIX = str(MH_MODELS_FOLDER / 'binder_lab_encodings')  # Keep as string for legacy compatibility
 
-# ==============================================================================
-# 2. MODERN PEPTIDE DATASET CLASS (Preserved Exactly)
-# ==============================================================================
-class PeptideDataset(Dataset):
-    def __init__(self, df, has_label=True):
-        self.df = df.reset_index(drop=True)
-        self.has_label = has_label
-        self.token = Params.dataset_params['token']
-        self.max_len = Params.dataset_params['max_seq_len']
-        self.pad_idx = self.token['pad']
-        
-    def tokenize(self, seq):
-        seq_str = str(seq)[:self.max_len]
-        tokens = [self.token['start']]
-        for aa in seq_str:
-            tokens.append(self.token.get(aa.strip(), self.token['unk']))
-        tokens.append(self.token['eos'])
-        return torch.tensor(tokens, dtype=torch.long)
-    
-    def __len__(self):
-        return len(self.df)
-    
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        seq_token = self.tokenize(row['seq'])
-        if self.has_label and 'label' in self.df.columns:
-            try:
-                label = torch.tensor(float(row['label']), dtype=torch.float32)
-            except Exception:
-                label = torch.tensor(0.0, dtype=torch.float32)
-            return seq_token, label
-        return seq_token
-
-def safe_collate(batch):
-    PAD_IDX = Params.dataset_params['token']['pad']
-    if isinstance(batch[0], tuple):
-        seqs, labels = zip(*batch)
-        labels = torch.stack(labels)
-    else:
-        seqs = batch
-        labels = None
-    lengths = torch.tensor([len(s) for s in seqs])
-    padded = torch.nn.utils.rnn.pad_sequence(seqs, batch_first=True, padding_value=PAD_IDX)
-    return (padded, labels) if labels is not None else padded
+os.makedirs(RESULTS_FOLDER, exist_ok=True)
 
 # ==============================================================================
-# 3. INLINE ENCODING FUNCTION (Preserved Exactly)
+# 2. VERIFY REQUIRED FILES
 # ==============================================================================
-def encode_and_save(data_path, model_path, param, filename, save_folder):
-    """Modern encoder that uses dataset_params instead of extension_dataset_params."""
-    import pandas as pd
-    
-    hdf5_path = os.path.join(save_folder, f"{filename}.h5")
-    
-    # Load model
-    MP = param.RNN_VAE_params.copy()
-    if 'condition_length' in MP:
-        del MP['condition_length']
-    model = RNN_VAE(**MP).to(param.device)
-    state_dict = torch.load(str(model_path), map_location=param.device)
-    model.load_state_dict(state_dict)
-    model.eval()
-    
-    # Create dataset & dataloader
-    df = pd.read_csv(str(data_path), keep_default_na=False)
-    dataset = PeptideDataset(df, has_label=True)
-    dataloader = DataLoader(dataset, batch_size=512, shuffle=False, collate_fn=safe_collate)
-    
-    print(f"Encoding {len(df)} sequences...")
-    all_z = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for seq_tokens, labels in dataloader:
-            seq_tokens = seq_tokens.to(param.device)
-            (z_mu, _), _, _ = model(seq_tokens)
-            all_z.append(z_mu.cpu().numpy())
-            all_labels.append(labels.numpy().reshape(-1, 1))
-    
-    z_final = np.concatenate(all_z, axis=0)
-    labels_final = np.concatenate(all_labels, axis=0)
-    data_to_save = np.concatenate([z_final, labels_final], axis=1)
-    
-    with h5py.File(hdf5_path, 'w') as hf:
-        hf.create_dataset('data', data=data_to_save, compression="gzip", chunks=True)
-    
-    print(f"✅ Saved encodings: {hdf5_path} | Shape: {data_to_save.shape}")
-    return data_to_save
+required_files = [
+    LABELED_ENC_PATH, UNLABELED_ENC_PATH, 
+    LABELED_DATA_PATH, MODEL_CKPT
+]
+
+print("\nChecking required files...")
+for path in required_files:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Required file not found: {path}\n"
+            f"Please run the encoding scripts first or download assets via scripts/download_assets.py"
+        )
+print("✅ All required files exist.")
 
 # ==============================================================================
-# 4. PIPELINE CONFIGURATION (Portable Paths)
+# 3. LOAD AND VALIDATE LABELED CSV DATA
 # ==============================================================================
-save_folder = PROJECT_ROOT / 'mh_results'
-model_path = PROJECT_ROOT / 'model_best.ckpt'
-labelled_data_path = PROJECT_ROOT / 'binder_lab.csv'
-extension_filename = 'label_extension13_train_beta'
+print("\nLoading labeled CSV data...")
+label_df = pd.read_csv(str(LABELED_DATA_PATH))
+
+required_columns = {'seq', 'label'}
+if not required_columns.issubset(label_df.columns):
+    raise ValueError(f"CSV must contain columns {required_columns}. Found: {label_df.columns.tolist()}")
+
+label_df = label_df.dropna(subset=['seq', 'label']).copy()
+label_df['seq'] = label_df['seq'].astype(str).str.strip()
+label_df = label_df[label_df['seq'] != '']
+
+label_df['label'] = pd.to_numeric(label_df['label'], errors='raise').astype(int)
+unique_labels = set(label_df['label'].unique())
+
+if not unique_labels.issubset({0, 1}):
+    raise ValueError("Expected binary labels 0 and 1 in binder_lab.csv.")
+if unique_labels != {0, 1}:
+    raise ValueError("Both label 0 and label 1 must be present in binder_lab.csv.")
+
+print(f"Labeled CSV loaded: {label_df.shape}")
+print("Label distribution:")
+print(label_df['label'].value_counts().sort_index())
+
+# ==============================================================================
+# 4. LOAD PRECOMPUTED ENCODINGS
+# ==============================================================================
+print("\n########## 1. Loading precomputed encodings ##########")
+
+with h5py.File(str(LABELED_ENC_PATH), 'r') as hf:
+    labelled_encodings = np.asarray(hf['data'])
+
+with h5py.File(str(UNLABELED_ENC_PATH), 'r') as hf:
+    unlabeled_encodings = np.asarray(hf['data'])
+
+print(f"Labeled encodings shape: {labelled_encodings.shape}")
+print(f"Unlabeled encodings shape: {unlabeled_encodings.shape}")
+
+# Validate dimensions
+Z_DIM = Params.RNN_VAE_params.get('z_dim', 256)
+expected_labeled_cols = Z_DIM + 1
+expected_unlabeled_cols = Z_DIM
+
+if labelled_encodings.ndim != 2 or labelled_encodings.shape[1] != expected_labeled_cols:
+    raise ValueError(
+        f"Labeled encodings must be 2D with {expected_labeled_cols} columns "
+        f"({Z_DIM} latent + 1 label). Got {labelled_encodings.shape[1]}."
+    )
+
+if unlabeled_encodings.ndim != 2 or unlabeled_encodings.shape[1] != expected_unlabeled_cols:
+    raise ValueError(
+        f"Unlabeled encodings must be 2D with {expected_unlabeled_cols} columns. "
+        f"Got {unlabeled_encodings.shape[1]}."
+    )
+
+if not np.isfinite(labelled_encodings).all():
+    raise ValueError("Labeled encodings contain NaN or infinity.")
+if not np.isfinite(unlabeled_encodings).all():
+    raise ValueError("Unlabeled encodings contain NaN or infinity.")
+
+encoding_labels = labelled_encodings[:, -1]
+if not np.isin(encoding_labels, [0, 1]).all():
+    raise ValueError("The final column of labeled encodings must contain only 0s and 1s.")
+
+print("✅ Encoding dimensions and values verified successfully.")
+
+# ==============================================================================
+# 5. TRAIN CLASSIFIER q(c|z)
+# ==============================================================================
+print("\n########## 2. Training q(c|z) classifier ##########")
 
 qcz_params = {
     'N_boots': 4,
-    'model_name': 'KNN',
-    'save_folder': str(save_folder / 'qcz_f1/KNN')
+    'model_name': 'XGB',
+    'save_folder': str(RESULTS_FOLDER / 'qcz_f1' / 'XGB')
 }
+
 to_train_qcz = True
+
+if to_train_qcz:
+    print("Training new classifier models...")
+    qcz_models = train_qcz(labelled_encodings, **qcz_params)
+else:
+    print("Loading existing classifier models...")
+    qcz_models = []
+    qcz_save_dir = Path(qcz_params['save_folder'])
+
+    if not qcz_save_dir.is_dir():
+        raise FileNotFoundError(f"Classifier folder not found: {qcz_save_dir}")
+
+    for filename in sorted(qcz_save_dir.iterdir()):
+        if filename.suffix == '.pkl':
+            with open(str(filename), 'rb') as f:
+                qcz_models.append(pickle.load(f))
+
+    if not qcz_models:
+        raise FileNotFoundError(f"No saved classifier .pkl files found in {qcz_save_dir}")
+
+print(f"✅ Classifier ready. Number of models: {len(qcz_models)}")
+
+# ==============================================================================
+# 6. TRAIN GMM PRIOR q(z)
+# ==============================================================================
+print("\n########## 3. Training q(z) GMM prior ##########")
 
 qz_params = {
     'model_name': 'GMM',
     'n_components': 5,
-    'save_folder': str(save_folder / 'qz')
+    'save_folder': str(RESULTS_FOLDER / 'qz')
 }
+
+qz_model = train_qz(unlabeled_encodings, **qz_params)
+print("✅ GMM prior training complete.")
+
+# ==============================================================================
+# 7. CONFIGURE DE NOVO MH SAMPLING
+# ==============================================================================
+print("\n########## 4. Configuring de novo MH sampling ##########")
 
 MH_sampling_params = {
-    'exploration_rate': [0.5, 0.1],
+    'exploration_rate': [0.05, 0.2],
     'N_chains': 150,
-    'burn_in': 500,
+    'burn_in': 50,
     'extension_model': RNN_VAE,
-    'model_path': str(model_path),
+    'model_path': str(MODEL_CKPT),
     'extension_params': Params,
-    'labeled_encoding_path': str(save_folder / extension_filename),
-    'labeled_data_path': str(labelled_data_path),
+    'labeled_encoding_path': LABELED_ENC_PREFIX,
+    'labeled_data_path': str(LABELED_DATA_PATH),
     'base': '',
-    'seqs_dict': {i: {} for i in range(7, 22)},
-    'lens': list(range(7, 22)),
-    'desired_N': [15] * 8,
-    'result_file_name': str(save_folder / 'beta_1st_denovo')
+    'seqs_dict': {i: {} for i in range(7, 34)},
+    'lens': list(range(7, 34)),
+    'desired_N': [15] * 27,
+    'result_file_name': str(RESULTS_FOLDER / 'denovo_mh_results')
 }
 
 # ==============================================================================
-# 5. EXECUTION PIPELINE
+# 8. RUN METROPOLIS-HASTINGS SAMPLING
 # ==============================================================================
-os.makedirs(save_folder, exist_ok=True)
+print("\n########## 5. Starting MH de novo sampling ##########")
 
-# --- STEP 1: ENCODE (Smart caching + modern encoder) ---
-print('######### 1. Saving/Loading Encodings ###########')
-enc_h5_path = save_folder / f"{extension_filename}.h5"
+sampling_seqs(
+    qcz_models=qcz_models,
+    qz_model=qz_model,
+    **MH_sampling_params
+)
 
-if enc_h5_path.exists():
-    print(f"✅ Found existing encodings: {enc_h5_path}")
-    with h5py.File(str(enc_h5_path), 'r') as hf:
-        sampling_model_training_data = np.array(hf['data'])
-else:
-    print(" No cached encodings. Running VAE encoder...")
-    sampling_model_training_data = encode_and_save(
-        data_path=str(labelled_data_path),
-        model_path=str(model_path),
-        param=Params,
-        filename=extension_filename,
-        save_folder=str(save_folder)
-    )
+print("\n########## ✅ MH sampling finished successfully ##########")
 
-encodings = sampling_model_training_data[:, :-1]
-labelled_encodings = sampling_model_training_data
-print('######### Finished saving encodings ###########')
-
-# --- STEP 2: TRAIN SURROGATE MODELS ---
-print('######### 2. Training q(z|c) and q(z) Models ###########')
-if to_train_qcz:
-    print("Training QcZ (Classifier)...")
-    qcz_models = train_qcz(labelled_encodings, **qcz_params)
-else:
-    print("Loading existing QcZ models...")
-    qcz_models = []
-    qcz_save_dir = Path(qcz_params['save_folder'])
-    if qcz_save_dir.exists():
-        for f in sorted(qcz_save_dir.iterdir()):
-            if f.suffix == '.sav':
-                qcz_models.append(pickle.load(open(str(f), 'rb')))
-    else:
-        raise FileNotFoundError(f"QcZ folder not found: {qcz_save_dir}")
-
-print("Training Qz (GMM Prior)...")
-qz_model = train_qz(encodings, **qz_params)
-print('######### Finished training models ###########')
-
-# --- STEP 3: MH SAMPLING ---
-print('######### 3. Metropolis-Hastings Sampling ###########')
-sampling_seqs(qcz_models, qz_model, **MH_sampling_params)
-print('######### Finished MH sampling ###########')
+# ==============================================================================
+# 9. OUTPUT SUMMARY
+# ==============================================================================
+print(f"\nResults saved to: {RESULTS_FOLDER}")
+print("Expected output files:")
+for length in range(7, 34):
+    print(f"  - denovo_mh_results_{length}.txt")
+print("Corresponding latent encodings are saved as .npy files in the same directory.")
